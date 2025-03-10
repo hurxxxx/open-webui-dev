@@ -90,6 +90,8 @@ from open_webui.models.functions import Functions
 from open_webui.models.models import Models
 from open_webui.models.users import UserModel, Users
 
+from open_webui.tasks import create_task
+
 from open_webui.config import (
     LICENSE_KEY,
     # Ollama
@@ -989,79 +991,81 @@ async def chat_completion(
     if not request.app.state.MODELS:
         await get_all_models(request, user=user)
 
-    model_item = form_data.pop("model_item", {})
-    tasks = form_data.pop("background_tasks", None)
+    form_data_copy = form_data.copy()
+    model_item = form_data_copy.pop("model_item", {})
+    tasks = form_data_copy.pop("background_tasks", None)
 
-    try:
-        if not model_item.get("direct", False):
-            model_id = form_data.get("model", None)
-            if model_id not in request.app.state.MODELS:
-                raise Exception("Model not found")
+    async def process_chat(form_data: dict, model_item: dict, tasks: dict):
+        try:
+            if not model_item.get("direct", False):
+                model_id = form_data.get("model", None)
+                if model_id not in request.app.state.MODELS:
+                    raise Exception("Model not found")
 
-            model = request.app.state.MODELS[model_id]
-            model_info = Models.get_model_by_id(model_id)
+                model = request.app.state.MODELS[model_id]
+                model_info = Models.get_model_by_id(model_id)
 
-            # Check if user has access to the model
-            if not BYPASS_MODEL_ACCESS_CONTROL and user.role == "user":
-                try:
-                    check_model_access(user, model)
-                except Exception as e:
-                    raise e
-        else:
-            model = model_item
-            model_info = None
+                # Check if user has access to the model
+                if not BYPASS_MODEL_ACCESS_CONTROL and user.role == "user":
+                    try:
+                        check_model_access(user, model)
+                    except Exception as e:
+                        raise e
+            else:
+                model = model_item
+                model_info = None
 
-            request.state.direct = True
-            request.state.model = model
+                request.state.direct = True
+                request.state.model = model
 
-        metadata = {
-            "user_id": user.id,
-            "chat_id": form_data.pop("chat_id", None),
-            "message_id": form_data.pop("id", None),
-            "session_id": form_data.pop("session_id", None),
-            "tool_ids": form_data.get("tool_ids", None),
-            "files": form_data.get("files", None),
-            "features": form_data.get("features", None),
-            "variables": form_data.get("variables", None),
-            "model": model,
-            "direct": model_item.get("direct", False),
-            **(
-                {"function_calling": "native"}
-                if form_data.get("params", {}).get("function_calling") == "native"
-                or (
-                    model_info
-                    and model_info.params.model_dump().get("function_calling")
-                    == "native"
-                )
-                else {}
-            ),
-        }
+            metadata = {
+                "user_id": user.id,
+                "chat_id": form_data.pop("chat_id", None),
+                "message_id": form_data.pop("id", None),
+                "session_id": form_data.pop("session_id", None),
+                "tool_ids": form_data.get("tool_ids", None),
+                "files": form_data.get("files", None),
+                "features": form_data.get("features", None),
+                "variables": form_data.get("variables", None),
+                "model": model,
+                "direct": model_item.get("direct", False),
+                **(
+                    {"function_calling": "native"}
+                    if form_data.get("params", {}).get("function_calling") == "native"
+                    or (
+                        model_info
+                        and model_info.params.model_dump().get("function_calling")
+                        == "native"
+                    )
+                    else {}
+                ),
+            }
 
-        request.state.metadata = metadata
-        form_data["metadata"] = metadata
+            request.state.metadata = metadata
+            form_data["metadata"] = metadata
 
-        form_data, metadata, events = await process_chat_payload(
-            request, form_data, user, metadata, model
-        )
+            form_data, metadata, events = await process_chat_payload(
+                request, form_data, user, metadata, model
+            )
 
-    except Exception as e:
-        log.debug(f"Error processing chat payload: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+            response = await chat_completion_handler(request, form_data, user)
 
-    try:
-        response = await chat_completion_handler(request, form_data, user)
+            return await process_chat_response(
+                request, response, form_data, user, metadata, model, events, tasks
+            )
 
-        return await process_chat_response(
-            request, response, form_data, user, metadata, model, events, tasks
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+        except Exception as e:
+            log.debug(f"Error in chat completion: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(e),
+            )
+
+    task_id, task = create_task(process_chat(form_data_copy, model_item, tasks))
+        
+    return {
+        "task_id": task_id,
+    }
 
 
 # Alias for chat_completion (Legacy)
